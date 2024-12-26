@@ -1,0 +1,154 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r cars}
+# Quietly load required libraries
+suppressPackageStartupMessages({
+  library(car)
+  library(caret)
+  library(pROC)
+})
+
+# Rest of the code remains exactly the same
+original_df <- read.csv('NCAA_mbb_matchup_metrics_2024.csv')
+original_df["home_team_win"] = ifelse(original_df["winner"] == original_df["home_team"], 1, 0)
+
+# Sort data chronologically
+original_df <- original_df[order(original_df$date), ]
+
+# Define column groups
+meta <- c("date", "home_team", "away_team", "home_team_score", "away_team_score", "home_team_win", "neutral_game")
+rank_cols <- grep("_r", names(original_df), value = TRUE)
+non_rank_cols <- setdiff(names(original_df), c(rank_cols, meta, "winner"))
+
+# Create separate dataframes
+rank_df <- original_df[, c(meta, rank_cols)]
+non_rank_df <- original_df[, c(meta, non_rank_cols)]
+
+# Create chronological train/test split (80/20 split)
+n_rows <- nrow(original_df)
+train_size <- floor(0.8 * n_rows)
+train_index <- 1:train_size
+
+# Split datasets
+non_rank_train <- non_rank_df[train_index, ]
+non_rank_test <- non_rank_df[-train_index, ]
+rank_train <- rank_df[train_index, ]
+rank_test <- rank_df[-train_index, ]
+
+# Function to evaluate model performance
+evaluate_model <- function(model, test_data, actual_col = "home_team_win", threshold=0.5, plot=TRUE) {
+    pred_probs <- predict(model, newdata = test_data, type = "response")
+    pred_class <- ifelse(pred_probs > threshold, 1, 0)
+    actual <- as.vector(unlist(test_data[actual_col]))
+    
+    confusion_mat <- table(Predicted = pred_class, Actual = actual)
+    accuracy <- sum(diag(confusion_mat)) / sum(confusion_mat)
+    sensitivity <- confusion_mat[2,2] / sum(confusion_mat[,2])
+    specificity <- confusion_mat[1,1] / sum(confusion_mat[,1])
+    roc_obj <- roc(actual, pred_probs)
+    auc <- auc(roc_obj)
+    
+    # addition for ROC curve plot
+    if(plot) {
+      plot(roc_obj, main = paste("ROC Curve (AUC =", round(auc, 3), ")"), col = "blue", lwd = 2)
+      grid()
+    }
+    
+    return(list(
+        confusion_matrix = confusion_mat,
+        accuracy = accuracy,
+        sensitivity = sensitivity,
+        specificity = specificity,
+        auc = auc
+    ))
+}
+
+# Quietly fit models and perform feature selection
+exclude_cols <- c("date", "home_team", "away_team", "home_team_score", "away_team_score", "home_team_win")
+predictor_cols_non_rank <- setdiff(names(non_rank_df), exclude_cols)
+non_rank_formula <- reformulate(predictor_cols_non_rank, response = "home_team_win")
+non_rank_model <- glm(non_rank_formula, data=non_rank_train, family=binomial)
+back_feat_sel <- step(non_rank_model, direction="backward", trace=0)
+final_non_rank_model <- eval(back_feat_sel$call)
+
+predictor_cols_rank <- setdiff(names(rank_df), exclude_cols)
+rank_formula <- reformulate(predictor_cols_rank, response = "home_team_win")
+rank_model <- glm(rank_formula, data=rank_train, family=binomial)
+rank_back_feat_sel <- step(rank_model, direction="backward", trace=0)
+final_rank_model <- eval(rank_back_feat_sel$call)
+
+# Print final results
+cat("\n=== Non-Rank Model Performance ===\n")
+non_rank_metrics <- evaluate_model(final_non_rank_model, non_rank_test)
+print("Test Set Metrics:")
+print(paste("Accuracy:", round(non_rank_metrics$accuracy, 3)))
+print(paste("Sensitivity:", round(non_rank_metrics$sensitivity, 3)))
+print(paste("Specificity:", round(non_rank_metrics$specificity, 3)))
+print(paste("AUC:", round(non_rank_metrics$auc, 3)))
+print("\nConfusion Matrix:")
+print(non_rank_metrics$confusion_matrix)
+
+cat("\n=== Rank Model Performance ===\n")
+rank_metrics <- evaluate_model(final_rank_model, rank_test)
+print("Test Set Metrics:")
+print(paste("Accuracy:", round(rank_metrics$accuracy, 3)))
+print(paste("Sensitivity:", round(rank_metrics$sensitivity, 3)))
+print(paste("Specificity:", round(rank_metrics$specificity, 3)))
+print(paste("AUC:", round(rank_metrics$auc, 3)))
+print("\nConfusion Matrix:")
+print(rank_metrics$confusion_matrix)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+Summary Models
+```{r}
+summary(rank_model)
+summary(non_rank_model)
+```
+Goodness of Fit
+```{r}
+res1 = resid(rank_model,type="deviance")
+qqnorm(res1, ylab="Std residuals")
+qqline(res1,col="blue",lwd=2)
+hist(res1,10,xlab="Std residuals", main="")
+
+res2 = resid(non_rank_model,type="deviance")
+qqnorm(res2, ylab="Std residuals")
+qqline(res2,col="blue",lwd=2)
+hist(res2,10,xlab="Std residuals", main="")
+```
+Hyperparameter Search
+```{r, include=FALSE}
+thresholds = seq(0.45, 0.6, by=0.001)
+rank_accs <- c()
+non_rank_accs <- c()
+for(threshold in thresholds) {
+  non_rank_metrics <- evaluate_model(final_non_rank_model, non_rank_test, threshold=threshold, plot=FALSE)
+  rank_metrics <- evaluate_model(final_rank_model, rank_test, threshold=threshold, plot=FALSE)
+  rank_accs <- c(rank_accs, rank_metrics$accuracy)
+  non_rank_accs <- c(non_rank_accs, non_rank_metrics$accuracy)
+}
+max_rank_threshold <- thresholds[which.max(rank_accs)]
+max_non_rank_threshold <- thresholds[which.max(non_rank_accs)]
+```
+```{r}
+plot(
+  thresholds, rank_accs, type = "o", col = "blue", pch = '.', ylim = range(c(rank_accs, non_rank_accs)),
+  xlab = "Threshold", ylab = "Accuracy", main = "Model Accuracy vs. Threshold"
+)
+lines(thresholds, non_rank_accs, type = "o", col = "red", pch = '.')
+abline(v = max_rank_threshold, col = "blue", lty = 2) # Dashed line for rank model
+abline(v = max_non_rank_threshold, col = "red", lty = 2) # Dashed line for non-rank model
+legend("bottomright", legend = c("Rank Model", "Non-Rank Model"), col = c("blue", "red"), lty = 1, pch = 16)
+text(
+  x = max_rank_threshold + 0.018, y = max(rank_accs), 
+  labels = paste("Max Rank:", max_rank_threshold), pos = 3, col = "blue"
+)
+text(
+  x = max_non_rank_threshold - 0.021, y = max(non_rank_accs) - .0025, 
+  labels = paste("Max Non-Rank:", max_non_rank_threshold), pos = 3, col = "red"
+)
+```
